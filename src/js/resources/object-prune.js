@@ -27,12 +27,64 @@ import { safeSelf } from './safe-self.js';
 
 /******************************************************************************/
 
+//  Split a space-separated list of object paths. A path can end with a value
+//  filter, i.e. `a.b.[=].value`, in which case the property is considered
+//  only if its value matches. `value` can be `true`, `false`, a number, a
+//  string, or a `/regex/`. Spaces are allowed in a `/regex/` value.
+
+function objectPathsFn(rawPaths) {
+    if ( typeof rawPaths !== 'string' || rawPaths === '' ) { return []; }
+    const safe = safeSelf();
+    const marker = '.[=].';
+    const tokens = rawPaths.match(/(?:\.\[=\]\.\/(?:[^/\\]|\\.)*\/[gimsu]*|\S)+/g) || [];
+    return tokens.map(token => {
+        const pos = token.indexOf(marker);
+        if ( pos === -1 ) { return { path: token }; }
+        const path = token.slice(0, pos);
+        const raw = token.slice(pos + marker.length);
+        let valueDetails;
+        if ( raw === 'true' ) {
+            valueDetails = { value: true };
+        } else if ( raw === 'false' ) {
+            valueDetails = { value: false };
+        } else if ( /^\d+$/.test(raw) ) {
+            valueDetails = { value: parseInt(raw, 10) };
+        } else if ( /^\/.+\/[gimsu]*$/.test(raw) ) {
+            const { re } = safe.initPattern(raw.replace(/[gimsu]*$/, m => m.replace(/g/g, '')));
+            valueDetails = { re };
+        } else {
+            valueDetails = { value: raw };
+        }
+        return { path, valueDetails };
+    });
+}
+registerScriptlet(objectPathsFn, {
+    name: 'object-paths.fn',
+    dependencies: [
+        safeSelf,
+    ],
+});
+
+/******************************************************************************/
+
 function objectFindOwnerFn(
     root,
     path,
-    prune = false
+    prune = false,
+    valueDetails = undefined
 ) {
     const safe = safeSelf();
+    const matchesValue = v => {
+        if ( valueDetails === undefined ) { return true; }
+        if ( valueDetails.re === undefined ) {
+            return v === valueDetails.value;
+        }
+        const t = typeof v;
+        if ( t !== 'string' && t !== 'number' && t !== 'boolean' ) {
+            return false;
+        }
+        return safe.RegExp_test(valueDetails.re, `${v}`);
+    };
     let owner = root;
     let chain = path;
     for (;;) {
@@ -40,16 +92,18 @@ function objectFindOwnerFn(
         const pos = chain.indexOf('.');
         if ( pos === -1 ) {
             if ( prune === false ) {
-                return safe.Object_hasOwn(owner, chain);
+                return safe.Object_hasOwn(owner, chain) &&
+                    matchesValue(owner[chain]);
             }
             let modified = false;
             if ( chain === '*' ) {
                 for ( const key in owner ) {
                     if ( safe.Object_hasOwn(owner, key) === false ) { continue; }
+                    if ( matchesValue(owner[key]) === false ) { continue; }
                     delete owner[key];
                     modified = true;
                 }
-            } else if ( safe.Object_hasOwn(owner, chain) ) {
+            } else if ( safe.Object_hasOwn(owner, chain) && matchesValue(owner[chain]) ) {
                 delete owner[chain];
                 modified = true;
             }
@@ -61,7 +115,7 @@ function objectFindOwnerFn(
         if ( prop === '[-]' && Array.isArray(owner) ) {
             let i = owner.length;
             while ( i-- ) {
-                if ( objectFindOwnerFn(owner[i], next) === false ) { continue; }
+                if ( objectFindOwnerFn(owner[i], next, false, valueDetails) === false ) { continue; }
                 owner.splice(i, 1);
                 found = true;
             }
@@ -69,7 +123,7 @@ function objectFindOwnerFn(
         }
         if ( prop === '{-}' && owner instanceof Object ) {
             for ( const key of Object.keys(owner) ) {
-                if ( objectFindOwnerFn(owner[key], next) === false ) { continue; }
+                if ( objectFindOwnerFn(owner[key], next, false, valueDetails) === false ) { continue; }
                 delete owner[key];
                 found = true;
             }
@@ -81,7 +135,7 @@ function objectFindOwnerFn(
             prop === '*' && owner instanceof Object
         ) {
             for ( const key of Object.keys(owner) ) {
-                if (objectFindOwnerFn(owner[key], next, prune) === false ) { continue; }
+                if ( objectFindOwnerFn(owner[key], next, prune, valueDetails) === false ) { continue; }
                 found = true;
             }
             return found;
@@ -116,11 +170,9 @@ export function objectPruneFn(
 ) {
     if ( typeof rawPrunePaths !== 'string' ) { return; }
     const safe = safeSelf();
-    const prunePaths = rawPrunePaths !== ''
-        ? safe.String_split.call(rawPrunePaths, / +/)
-        : [];
-    const needlePaths = prunePaths.length !== 0 && rawNeedlePaths !== ''
-        ? safe.String_split.call(rawNeedlePaths, / +/)
+    const prunePaths = objectPathsFn(rawPrunePaths);
+    const needlePaths = prunePaths.length !== 0
+        ? objectPathsFn(rawNeedlePaths)
         : [];
     if ( stackNeedleDetails.matchAll !== true ) {
         if ( matchesStackTraceFn(stackNeedleDetails, extraArgs.logstack) === false ) {
@@ -129,8 +181,8 @@ export function objectPruneFn(
     }
     if ( objectPruneFn.mustProcess === undefined ) {
         objectPruneFn.mustProcess = (root, needlePaths) => {
-            for ( const needlePath of needlePaths ) {
-                if ( objectFindOwnerFn(root, needlePath) === false ) {
+            for ( const { path, valueDetails } of needlePaths ) {
+                if ( objectFindOwnerFn(root, path, false, valueDetails) === false ) {
                     return false;
                 }
             }
@@ -140,8 +192,8 @@ export function objectPruneFn(
     if ( prunePaths.length === 0 ) { return; }
     let outcome = 'nomatch';
     if ( objectPruneFn.mustProcess(obj, needlePaths) ) {
-        for ( const path of prunePaths ) {
-            if ( objectFindOwnerFn(obj, path, true) ) {
+        for ( const { path, valueDetails } of prunePaths ) {
+            if ( objectFindOwnerFn(obj, path, true, valueDetails) ) {
                 outcome = 'match';
             }
         }
@@ -153,6 +205,7 @@ registerScriptlet(objectPruneFn, {
     dependencies: [
         matchesStackTraceFn,
         objectFindOwnerFn,
+        objectPathsFn,
         safeSelf,
     ],
 });
@@ -183,16 +236,12 @@ function trustedPruneInboundObject(
     const safe = safeSelf();
     const extraArgs = safe.parseVarargs(varargs);
     const needlePaths = [];
-    if ( rawPrunePaths !== '' ) {
-        needlePaths.push(...safe.String_split.call(rawPrunePaths, / +/));
-    }
-    if ( rawNeedlePaths !== '' ) {
-        needlePaths.push(...safe.String_split.call(rawNeedlePaths, / +/));
-    }
+    needlePaths.push(...objectPathsFn(rawPrunePaths));
+    needlePaths.push(...objectPathsFn(rawNeedlePaths));
     const stackNeedle = safe.initPattern(extraArgs.stackToMatch || '', { canNegate: true });
     const mustProcess = root => {
-        for ( const needlePath of needlePaths ) {
-            if ( objectFindOwnerFn(root, needlePath) === false ) {
+        for ( const { path, valueDetails } of needlePaths ) {
+            if ( objectFindOwnerFn(root, path, false, valueDetails) === false ) {
                 return false;
             }
         }
@@ -232,6 +281,7 @@ registerScriptlet(trustedPruneInboundObject, {
     requiresTrust: true,
     dependencies: [
         objectFindOwnerFn,
+        objectPathsFn,
         objectPruneFn,
         safeSelf,
     ],
