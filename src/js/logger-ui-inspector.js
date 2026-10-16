@@ -35,6 +35,7 @@ const filterToIdMap = new Map();
 
 let inspectedTabId = 0;
 let inspectedHostname = '';
+let inspectedURL = '';
 let uidGenerator = 1;
 
 /*******************************************************************************
@@ -108,8 +109,15 @@ const contentInspectorChannel = (( ) => {
     const onContentMessage = msg => {
         if ( msg.what === 'domLayoutFull' ) {
             inspectedHostname = msg.hostname;
+            inspectedURL = msg.url || '';
             renderDOMFull(msg);
         } else if ( msg.what === 'domLayoutIncremental' ) {
+            if ( msg.url ) {
+                inspectedURL = msg.url;
+            }
+            if ( msg.hostname ) {
+                inspectedHostname = msg.hostname;
+            }
             renderDOMIncremental(msg);
         }
     };
@@ -401,10 +409,16 @@ const startDialog = (( ) => {
         ev.stopPropagation();
 
         if ( target.id === 'createCosmeticFilters' ) {
-            vAPI.messaging.send('loggerUI', {
+            const docURL = inspectedURL || (inspectedHostname ? `https://${inspectedHostname}/` : undefined);
+            const msg = {
                 what: 'createUserFilter',
                 filters: textarea.value,
-            });
+            };
+            if ( docURL !== undefined ) {
+                msg.autoComment = true;
+                msg.docURL = docURL;
+            }
+            vAPI.messaging.send('loggerUI', msg);
             // Force a reload for the new cosmetic filter(s) to take effect
             vAPI.messaging.send('loggerUI', {
                 what: 'reloadTab',
@@ -591,6 +605,8 @@ const shutdownInspector = ( ) => {
     logger.removeAllChildren(domTree);
     dom.cl.remove(inspector, 'vExpanded');
     inspectedTabId = 0;
+    inspectedHostname = '';
+    inspectedURL = '';
 };
 
 /******************************************************************************/
